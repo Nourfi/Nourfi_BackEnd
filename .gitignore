@@ -16,6 +16,3 @@ dist/
 *.egg-info/
 .venv/
 .venv
-# RAG generated data
-App/AI-RAG/data/embeddings/
-App/AI-RAG/data/processed/
