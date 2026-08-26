@@ -14,8 +14,6 @@ Features:
 - Hard boundaries between standards.
 - Supports 15-standard and 54-standard corpora.
 - Skips front matter and chunks without a standard number.
-- Handles OCR-separated standard headings.
-- Ignores inline standard references.
 """
 
 import argparse
@@ -25,7 +23,7 @@ from pathlib import Path
 from statistics import mean, median
 
 
-BASE_DIR = Path(__file__).resolve().parents[2]
+BASE_DIR = Path(__file__).resolve().parents[1]
 
 
 CONTENT_TARGET = 425

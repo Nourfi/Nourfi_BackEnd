@@ -10,7 +10,7 @@ from database import get_connection
 # PATHS
 # ============================================================
 
-BASE_DIR = Path(__file__).resolve().parents[2]
+BASE_DIR = Path(__file__).resolve().parents[1]
 
 EMBEDDINGS_PATH = (
     BASE_DIR

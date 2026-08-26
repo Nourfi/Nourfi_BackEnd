@@ -5,9 +5,7 @@ from transformers import AutoTokenizer, AutoModel
 from database import get_connection
 
 
-# ============================================================
 # CONFIGURATION
-# ============================================================
 
 MODEL_NAME = "intfloat/multilingual-e5-small"
 
@@ -22,9 +20,7 @@ CANDIDATE_K = 15
 SEMANTIC_WEIGHT = 0.85
 
 
-# ============================================================
 # LOAD MODEL
-# ============================================================
 
 def load_model():
 
@@ -47,9 +43,7 @@ def load_model():
     return tokenizer, model, device
 
 
-# ============================================================
 # MEAN POOLING
-# ============================================================
 
 def mean_pooling(model_output, attention_mask):
 
@@ -64,9 +58,8 @@ def mean_pooling(model_output, attention_mask):
     ) / torch.clamp(input_mask_expanded.sum(dim=1), min=1e-9)
 
 
-# ============================================================
+
 # CREATE QUERY EMBEDDING
-# ============================================================
 
 def create_query_embedding(question, tokenizer, model, device):
 
@@ -96,9 +89,8 @@ def create_query_embedding(question, tokenizer, model, device):
     return embedding.cpu().numpy()[0].tolist()
 
 
-# ============================================================
+
 # VECTOR SEARCH (retrieval)
-# ============================================================
 
 def fetch_candidates(question, tokenizer, model, device, candidate_k=CANDIDATE_K):
     """Retrieve more candidates than needed, so the re-ranker has room to reorder."""
@@ -136,9 +128,8 @@ def fetch_candidates(question, tokenizer, model, device, candidate_k=CANDIDATE_K
     return results
 
 
-# ============================================================
+
 # RE-RANKING
-# ============================================================
 
 def tokenize_words(text):
     return set(re.findall(r"[a-zA-Z']+", text.lower()))
@@ -181,9 +172,8 @@ def rerank(question, candidates, top_k=TOP_K, semantic_weight=SEMANTIC_WEIGHT):
     return [row for _, row in scored[:top_k]]
 
 
-# ============================================================
+
 # DISPLAY RESULTS
-# ============================================================
 
 def display_results(question, results):
 
@@ -228,9 +218,7 @@ def display_results(question, results):
     print("-" * 80)
 
 
-# ============================================================
 # MAIN
-# ============================================================
 
 def main():
 

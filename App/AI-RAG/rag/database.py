@@ -8,7 +8,7 @@ import psycopg
 # LOAD .ENV
 # ============================================================
 
-BASE_DIR = Path(__file__).resolve().parents[2]
+BASE_DIR = Path(__file__).resolve().parents[3]
 
 load_dotenv(BASE_DIR / ".env")
 
