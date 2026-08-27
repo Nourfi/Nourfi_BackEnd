@@ -10,6 +10,7 @@
 4. une recherche vectorielle Top-5 par similarité cosinus ;
 5. une génération de réponse fondée uniquement sur les cinq extraits récupérés via OpenRouter ;
 6. des citations, un disclaimer et des garde-fous contre les fatwas et l’invention.
+7. reponse reformulée avec un style persona-based et un formatage strict des citations.  
 
 
 ## 2. État des tâches
@@ -22,7 +23,8 @@ Terminée et validée :
 - les embeddings sont stockés dans `extensions.vector(384)` ;
 - l’index HNSW accélère la recherche ;
 - la requête retourne les cinq chunks les plus proches ;
-- les métadonnées de standard et de pages sont disponibles pour les citations.
+- les métadonnées de standard et de pages sont disponibles pour les citations;
+- integration des 8 personas-prompts.
 
 #### les commandes pour exécuter cette tâche:
  - python App\AI-RAG\rag\chunker.py
@@ -87,8 +89,11 @@ DISCLAIMER_3=Disclaimer: This answer is based only on retrieved AAOIFI material.
 Depuis le dossier racine :
 
 ```powershell
-python App\AI-RAG\rag\pipeline.py
+default persona ' general_public ' :
+python App\AI-RAG\rag\pipeline.py 
 ```
+specific persona ' student, banker, investor, finance_specialist ... ' :
+python App\AI-RAG\rag\pipeline.py --persona student
 
 Le programme demande alors :
 
@@ -119,9 +124,7 @@ python scripts\pipeline.py --database-url "$env:SUPABASE_DB_URL" --question "Wha
 7. Le prompt système impose neutralité, traçabilité et absence de fatwa.
 8. OpenRouter reformule uniquement à partir du contexte.
 9. Le programme ajoute le disclaimer indépendamment du modèle.
-10. Les sources récupérées sont affichées à la fin ( et on a pas encore fait la tache Formatage strict des citations  
-obligatoires mais quand meme ils sont lisaibles et claires )
-11. Les sources récupérées sont affichées à la fin, avec les citations désormais au format strict et vérifié [Source : AAOIFI Standard X].
+10. Les sources récupérées sont affichées à la fin avec les citations désormais au format strict et vérifié [Source : AAOIFI Standard X].
 
 ## 8. Tests de validation
 
@@ -162,9 +165,11 @@ Vérifier : réponse prudente indiquant que les extraits AAOIFI ne suffisent pas
 
 - les modèles gratuits OpenRouter peuvent retourner une erreur `429` en cas de pool saturé ( j ai fait le auto retry );
 - les limites de quota dépendent d’OpenRouter et du fournisseur ;
-- le pipeline est un script Python local, pas encore une API web publique ;
-- les citations strictes au format doivent être finalisées par la tâche suivante ;
 - le disclaimer est informatif et ne transforme pas la sortie en avis religieux ou juridique.
+- modèle gratuit openrouter/free peut etre temporairement saturé ;
+- réponse vide retournée par le modèle ;
+- certains modèles gratuits répondent différemment selon la persona
+
 
 ## 10. notre tache suivante : 
 Tests de robustesse IA :Attaques Prompt Injection & Jailbreak (TST-05)
