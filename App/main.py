@@ -9,9 +9,18 @@ from App.models.user import User
 from App.core.security import verify_password 
 from App.core.encryption import encrypt_value, decrypt_value
 from App.models.financial_profile import FinancialProfile
+from App.models.conversation import Conversation
+from App.models.message import Message
+from fastapi.middleware.cors import CORSMiddleware
 import uuid
 app = FastAPI()
-
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 class RegisterRequest(BaseModel):
     name: str
     email: EmailStr   
@@ -61,8 +70,6 @@ class FinancialProfileRequest(BaseModel):
     investments: float | None = None
     postal_code: str | None = None
     credit: float | None = None
-
-
 @app.post("/api/v1/profile/financial")
 def create_financial_profile(payload: FinancialProfileRequest, db: Session = Depends(get_db)):
     new_profile = FinancialProfile(
@@ -94,3 +101,34 @@ def get_financial_profile(financial_id: str, db: Session = Depends(get_db)):
         "postal_code": decrypt_value(profile.postal_code),
         "credit": decrypt_value(profile.credit),
     }
+
+class CreateConversationRequest(BaseModel):
+    user_id: str
+    title: str
+@app.post("/api/v1/chat/conversations")
+def create_conversation(payload: CreateConversationRequest, db: Session = Depends(get_db)):
+    new_conv = Conversation(
+        conv_id=str(uuid.uuid4()),
+        user_id=payload.user_id,
+        title=payload.title,
+        created_at=datetime.utcnow(),
+    )
+    db.add(new_conv)
+    db.commit()
+    return {"conv_id": new_conv.conv_id, "title": new_conv.title}
+class SendMessageRequest(BaseModel):
+    conv_id: str
+    content: str
+    sender: str  
+@app.post("/api/v1/chat/messages")
+def send_message(payload: SendMessageRequest, db: Session = Depends(get_db)):
+    new_msg = Message(
+        msg_id=str(uuid.uuid4()),
+        conv_id=payload.conv_id,
+        content=payload.content,
+        sender=payload.sender,
+        timestamp=datetime.utcnow(),
+    )
+    db.add(new_msg)
+    db.commit()
+    return {"msg_id": new_msg.msg_id, "content": new_msg.content, "sender": new_msg.sender}
