@@ -1,3 +1,4 @@
+import argparse
 import re
 import torch
 from transformers import AutoTokenizer, AutoModel
@@ -18,6 +19,11 @@ CANDIDATE_K = 15
 # Weight given to keyword overlap vs. semantic similarity in final ranking.
 # 1.0 = pure semantic similarity, 0.0 = pure keyword overlap.
 SEMANTIC_WEIGHT = 0.85
+
+MVP_STANDARD_NUMBERS = (
+    8, 9, 10, 11, 12, 13, 17, 19,
+    25, 26, 30, 31, 39, 40, 46,
+)
 
 
 # LOAD MODEL
@@ -92,12 +98,27 @@ def create_query_embedding(question, tokenizer, model, device):
 
 # VECTOR SEARCH (retrieval)
 
-def fetch_candidates(question, tokenizer, model, device, candidate_k=CANDIDATE_K):
+def fetch_candidates(
+    question,
+    tokenizer,
+    model,
+    device,
+    corpus="54",
+    candidate_k=CANDIDATE_K,
+):
     """Retrieve more candidates than needed, so the re-ranker has room to reorder."""
 
     query_embedding = create_query_embedding(question, tokenizer, model, device)
 
-    sql = """
+    vector_string = "[" + ",".join(str(v) for v in query_embedding) + "]"
+    standard_filter = ""
+    parameters = [vector_string, candidate_k]
+
+    if corpus == "15":
+        standard_filter = "WHERE standard_number = ANY(%s)"
+        parameters.append(list(MVP_STANDARD_NUMBERS))
+
+    sql = f"""
         SELECT
             chunk_id,
             standard_number,
@@ -111,15 +132,14 @@ def fetch_candidates(question, tokenizer, model, device, candidate_k=CANDIDATE_K
         FROM match_rag_chunks(
             %s::vector,
             %s
-        );
+        )
+        {standard_filter};
     """
-
-    vector_string = "[" + ",".join(str(v) for v in query_embedding) + "]"
 
     try:
         with get_connection() as connection:
             with connection.cursor() as cursor:
-                cursor.execute(sql, (vector_string, candidate_k))
+                cursor.execute(sql, parameters)
                 results = cursor.fetchall()
     except Exception as e:
         print(f"[✗] Database query failed: {e}")
@@ -221,8 +241,19 @@ def display_results(question, results):
 # MAIN
 
 def main():
+    parser = argparse.ArgumentParser(
+        description="Search the selected NourFi RAG corpus."
+    )
+    parser.add_argument(
+        "--corpus",
+        choices=("15", "54"),
+        default="54",
+        help="15 for MVP or 54 for the complete corpus.",
+    )
+    parser.add_argument("--question")
+    args = parser.parse_args()
 
-    question = input("\nEnter your question: ").strip()
+    question = (args.question or input("\nEnter your question: ")).strip()
 
     if not question:
         print("[!] Question cannot be empty.")
@@ -233,7 +264,13 @@ def main():
     print()
     print("[*] Generating query embedding and retrieving candidates...")
 
-    candidates = fetch_candidates(question, tokenizer, model, device)
+    candidates = fetch_candidates(
+        question,
+        tokenizer,
+        model,
+        device,
+        corpus=args.corpus,
+    )
 
     if not candidates:
         print("[!] No results found.")

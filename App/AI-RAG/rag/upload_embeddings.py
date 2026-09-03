@@ -1,3 +1,13 @@
+"""
+NourFi — Upload Embeddings to Supabase
+
+Usage:
+
+    python App\\AI-RAG\\rag\\upload_embeddings.py --corpus 15
+    python App\\AI-RAG\\rag\\upload_embeddings.py --corpus 54
+"""
+
+import argparse
 import json
 from pathlib import Path
 
@@ -12,19 +22,36 @@ from database import get_connection
 
 BASE_DIR = Path(__file__).resolve().parents[1]
 
-EMBEDDINGS_PATH = (
-    BASE_DIR
-    / "data"
-    / "embeddings"
-    / "aaoifi_embeddings_15_standards.npy"
-)
-
-METADATA_PATH = (
-    BASE_DIR
-    / "data"
-    / "embeddings"
-    / "aaoifi_embedding_metadata_15_standards.json"
-)
+CORPUS_CONFIG = {
+    "15": {
+        "embeddings": (
+            BASE_DIR
+            / "data"
+            / "embeddings"
+            / "aaoifi_embeddings_15_standards.npy"
+        ),
+        "metadata": (
+            BASE_DIR
+            / "data"
+            / "embeddings"
+            / "aaoifi_embedding_metadata_15_standards.json"
+        ),
+    },
+    "54": {
+        "embeddings": (
+            BASE_DIR
+            / "data"
+            / "embeddings"
+            / "aaoifi_embeddings_54_standards.npy"
+        ),
+        "metadata": (
+            BASE_DIR
+            / "data"
+            / "embeddings"
+            / "aaoifi_embedding_metadata_54_standards.json"
+        ),
+    },
+}
 
 
 TABLE_NAME = "rag_chunks"
@@ -33,15 +60,39 @@ BATCH_SIZE = 50
 
 
 # ============================================================
+# ARGUMENTS
+# ============================================================
+
+def parse_arguments():
+    parser = argparse.ArgumentParser(
+        description="Upload NourFi RAG embeddings to Supabase."
+    )
+
+    parser.add_argument(
+        "--corpus",
+        choices=("15", "54"),
+        default="15",
+        help="15 for MVP or 54 for complete corpus.",
+    )
+
+    return parser.parse_args()
+
+
+# ============================================================
 # LOAD DATA
 # ============================================================
 
-def load_data():
+def load_data(embeddings_path, metadata_path):
 
     print("[*] Loading embeddings...")
 
+    if not embeddings_path.exists():
+        raise FileNotFoundError(
+            f"Embeddings file not found:\n{embeddings_path}"
+        )
+
     embeddings = np.load(
-        EMBEDDINGS_PATH
+        embeddings_path
     )
 
     print(
@@ -50,8 +101,13 @@ def load_data():
 
     print("[*] Loading metadata...")
 
+    if not metadata_path.exists():
+        raise FileNotFoundError(
+            f"Metadata file not found:\n{metadata_path}"
+        )
+
     with open(
-        METADATA_PATH,
+        metadata_path,
         "r",
         encoding="utf-8"
     ) as file:
@@ -116,15 +172,20 @@ def build_row(embedding, item):
 # UPLOAD
 # ============================================================
 
-def upload_embeddings():
+def upload_embeddings(corpus):
 
-    embeddings, metadata = load_data()
+    config = CORPUS_CONFIG[corpus]
+
+    embeddings, metadata = load_data(
+        config["embeddings"],
+        config["metadata"],
+    )
 
     total = len(metadata)
 
     print()
     print("=" * 70)
-    print("UPLOADING EMBEDDINGS TO SUPABASE")
+    print(f"UPLOADING EMBEDDINGS TO SUPABASE ({corpus}-STANDARD MODE)")
     print("=" * 70)
 
     print(f"[*] Total rows: {total}")
@@ -241,6 +302,10 @@ def upload_embeddings():
 # MAIN
 # ============================================================
 
-if __name__ == "__main__":
+def main():
+    args = parse_arguments()
+    upload_embeddings(args.corpus)
 
-    upload_embeddings()
+
+if __name__ == "__main__":
+    main()

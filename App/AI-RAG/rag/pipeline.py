@@ -34,6 +34,11 @@ TOP_K = 5
 MAX_QUERY_LENGTH = 512
 MAX_RETRIES = 4
 
+MVP_STANDARD_NUMBERS = (
+    8, 9, 10, 11, 12, 13, 17, 19,
+    25, 26, 30, 31, 39, 40, 46,
+)
+
 # CITATION VALIDATION
 # Exact required format:
 # [Source : AAOIFI Standard X]
@@ -268,9 +273,16 @@ def embed_query(
 def retrieve(
     database_url: str,
     query_vector: np.ndarray,
+    corpus: str = "54",
 ) -> list[dict[str, Any]]:
 
-    sql = """
+    standard_filter = ""
+    parameters: list[Any] = []
+
+    if corpus == "15":
+        standard_filter = "where standard_number = any(%s)"
+
+    sql = f"""
         select
             chunk_id,
             standard_number,
@@ -281,11 +293,18 @@ def retrieve(
             content,
             1 - (embedding <=> %s::vector) as similarity
         from public.rag_chunks
+        {standard_filter}
         order by embedding <=> %s::vector
         limit %s
     """
 
     vector = vector_literal(query_vector)
+    parameters.append(vector)
+
+    if corpus == "15":
+        parameters.append(list(MVP_STANDARD_NUMBERS))
+
+    parameters.extend((vector, TOP_K))
 
     with psycopg.connect(
         database_url,
@@ -295,7 +314,7 @@ def retrieve(
         with connection.cursor() as cursor:
             cursor.execute(
                 sql,
-                (vector, vector, TOP_K),
+                parameters,
             )
 
             columns = [
@@ -484,6 +503,13 @@ def main() -> None:
     )
 
     parser.add_argument(
+        "--corpus",
+        choices=("15", "54"),
+        default="54",
+        help="15 for MVP or 54 for the complete corpus.",
+    )
+
+    parser.add_argument(
         "--database-url",
         default=os.getenv("DATABASE_URL"),
     )
@@ -535,6 +561,7 @@ def main() -> None:
     results = retrieve(
         args.database_url,
         query_vector,
+        args.corpus,
     )
 
     if not results:
