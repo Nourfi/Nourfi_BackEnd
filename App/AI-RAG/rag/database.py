@@ -17,7 +17,7 @@ load_dotenv(BASE_DIR / ".env")
 # DATABASE URL
 # ============================================================
 
-DATABASE_URL = os.getenv("DATABASE_URL")
+DATABASE_URL = os.getenv("DATABASE_URL") or os.getenv("SUPABASE_DB_URL")
 
 if not DATABASE_URL:
     raise RuntimeError(

@@ -34,7 +34,7 @@ OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "openrouter/free")
 TOP_K = 5
 MAX_QUERY_LENGTH = 512
 MAX_RETRIES = 4
-CITATION_RE = re.compile(r"\[Source\s*:\s*AAOIFI Standard\s+([^\]\n]+)\]")
+CITATION_RE = re.compile(r"\[Source : AAOIFI Standard ([0-9]+)\]")
 
 FATWA_TERMS = (
     "fatwa",
@@ -315,7 +315,13 @@ def generate_answer(
 def main() -> None:
     parser = argparse.ArgumentParser(description="NourFi Top-5 RAG pipeline")
     parser.add_argument("--question", help="Question; if omitted, it is requested interactively")
-    parser.add_argument("--database-url", default=os.getenv("SUPABASE_DB_URL"))
+    parser.add_argument("--database-url", default=os.getenv("DATABASE_URL") or os.getenv("SUPABASE_DB_URL"))
+    parser.add_argument(
+        "--corpus",
+        choices=("15", "54"),
+        default="54",
+        help="Corpus label used by the automated pipeline; database rows are shared.",
+    )
     parser.add_argument("--model", default=OPENROUTER_MODEL)
     parser.add_argument(
         "--persona",
@@ -340,22 +346,21 @@ def main() -> None:
 
     tokenizer, encoder, device = load_encoder()
     query_vector = embed_query(question, tokenizer, encoder, device)
-    print("Searching the Top-5 AAOIFI chunks...", file=sys.stderr)
     results = retrieve(args.database_url, query_vector, question)
     if not results:
         print("The retrieved AAOIFI excerpts are insufficient to answer this question.")
         print("\n" + DISCLAIMER)
         return
 
-    print("Generating the grounded answer...", file=sys.stderr)
-    print(generate_answer(question, results, args.model, args.persona))
+    answer = generate_answer(question, results, args.model, args.persona)
+    print(answer)
     print("\n" + DISCLAIMER)
-    print("\nRetrieved sources:")
+    print("\nSources:")
     for item in results:
         print(
-            f"- Standard {item.get('standard_number', '?')}: {item.get('standard_title', '?')} "
-            f"(pages {item.get('page_start', '?')}-{item.get('page_end', '?')}, "
-            f"similarity {float(item.get('similarity', 0)):.4f})"
+            f"- AAOIFI Standard {item.get('standard_number', '?')} "
+            f"({item.get('standard_title', '?')}, "
+            f"pp. {item.get('page_start', '?')}-{item.get('page_end', '?')})"
         )
 
 
