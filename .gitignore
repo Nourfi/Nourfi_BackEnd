@@ -11,6 +11,7 @@ env/
 .DS_Store
 Thumbs.db
 *.log
+App/AI-RAG/data/embeddings/*.npy
 build/
 dist/
 *.egg-info/

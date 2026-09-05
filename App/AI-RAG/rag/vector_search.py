@@ -1,4 +1,5 @@
 import re
+import argparse
 import torch
 from transformers import AutoTokenizer, AutoModel
 
@@ -222,7 +223,12 @@ def display_results(question, results):
 
 def main():
 
-    question = input("\nEnter your question: ").strip()
+    parser = argparse.ArgumentParser(description="Search NourFi RAG chunks.")
+    parser.add_argument("--corpus", choices=("15", "54"), default="54")
+    parser.add_argument("--question")
+    args = parser.parse_args()
+
+    question = (args.question or input("\nEnter your question: ")).strip()
 
     if not question:
         print("[!] Question cannot be empty.")
