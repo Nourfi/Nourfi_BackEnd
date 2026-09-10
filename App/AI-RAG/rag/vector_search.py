@@ -2,6 +2,12 @@ import re
 import argparse
 import torch
 from transformers import AutoTokenizer, AutoModel
+from transformers.utils import logging as transformers_logging
+from huggingface_hub import logging as huggingface_logging
+
+transformers_logging.set_verbosity_error()
+transformers_logging.disable_progress_bar()
+huggingface_logging.set_verbosity_error()
 
 from database import get_connection
 
