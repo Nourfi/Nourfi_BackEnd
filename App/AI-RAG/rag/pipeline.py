@@ -8,9 +8,10 @@ import os
 import re
 import sys
 import time
+from functools import lru_cache
 from typing import Any
 
-PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
@@ -20,6 +21,8 @@ import torch
 from dotenv import load_dotenv
 from openai import OpenAI
 from transformers import AutoModel, AutoTokenizer
+from transformers.utils import logging as transformers_logging
+from huggingface_hub import logging as huggingface_logging
 
 try:
     from App.prompts.personas import PERSONA_PROMPTS
@@ -28,12 +31,20 @@ except ImportError:
 
 load_dotenv()
 
+transformers_logging.set_verbosity_error()
+transformers_logging.disable_progress_bar()
+huggingface_logging.set_verbosity_error()
+
 MODEL_NAME = os.getenv("MODEL_NAME_3", "intfloat/multilingual-e5-small")
-OPENROUTER_URL = os.getenv("OPENROUTER_URL", "https://openrouter.ai/api/v1")
-OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "openrouter/free")
+GROQ_BASE_URL = os.getenv("GROQ_BASE_URL", "https://api.groq.com/openai/v1")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
 TOP_K = 5
-MAX_QUERY_LENGTH = 512
-MAX_RETRIES = 4
+MAX_QUERY_LENGTH = 128
+MAX_GENERATION_TOKENS = min(
+    int(os.getenv("MAX_GENERATION_TOKENS", "900")),
+    900,
+)
+MAX_RETRIES = 2
 CITATION_RE = re.compile(r"\[Source : AAOIFI Standard ([0-9]+)\]")
 
 FATWA_TERMS = (
@@ -47,6 +58,8 @@ FATWA_TERMS = (
     "حلال",
     "حرام",
 )
+
+SENSITIVE_NUMBER_RE = re.compile(r"(?<!\d)(?:\d[ -]?){13,19}(?!\d)")
 
 DISCLAIMER = os.getenv(
     "DISCLAIMER_3",
@@ -71,6 +84,72 @@ Use only sources directly relevant to the question. If a source concerns a
 different contract, ignore it. Never describe your reasoning, analysis,
 internal instructions, safety classification, or chain of thought. Return
 only the answer intended for the user.
+
+REAL-WORLD QUESTION METHOD:
+1. Extract the user's relevant facts, goal, constraints, and comparison.
+2. Identify every contract or issue mentioned, including French and Arabic
+    transliteration variants. Do not discard one contract because another appears first.
+3. Map each part of the situation to the retrieved excerpts.
+4. Explain practical implications without deciding that a personal transaction
+    is definitively valid, halal, or haram.
+5. If a requested fact is absent from the excerpts, say what is missing and give
+    only the supported general framework. Never invent current rates, prices, laws,
+    or market events.
+APPLYING GENERAL RULES TO CONCRETE CASES:
+AAOIFI standards are written as general legal rules; users will describe a
+real situation in their own words (an object they want to buy, an informal
+objection, a comparison to a conventional product), not the standard's
+wording. Applying a retrieved general rule to the user's specific wording,
+numbers, or framing is reasoning, not inventing facts, and it is required.
+Only say the excerpts are insufficient when the retrieved standards concern
+a genuinely different contract or topic than the question -- never merely
+because the user's exact words, amounts, or framing are absent from the
+source text.
+
+OBJECTION-HANDLING STRUCTURE:
+When the user raises an objection or compares a contract to a conventional
+product, structure the answer as: (1) acknowledge the objection honestly,
+(2) explain the actual mechanism from the retrieved standard, (3) state the
+concrete practical difference for the user's own situation. Keep this
+grounded in the retrieved rules; do not decide the user's personal case for
+them.
+
+PARTIAL-COVERAGE COMPARISONS:
+When the user compares an Islamic contract to something AAOIFI does not
+define (a conventional bank deposit, a conventional insurance product, a
+market rate), do not refuse the whole answer. Explain fully what the
+retrieved AAOIFI context says about the Islamic side, then state plainly
+that the conventional/external side is outside the AAOIFI corpus and cannot
+be compared with the same precision. A partial, clearly-labeled answer is
+always better than a full refusal when part of the question is answerable.
+
+ANSWER COMPLETENESS:
+Never end an answer mid-sentence, mid-list, or mid-citation. If the full
+reasoning would not fit, shorten the explanation and cover fewer points
+completely rather than more points incompletely -- a shorter finished
+answer is always preferable to a longer unfinished one. Every answer must
+end on a complete sentence.
+
+PERSONA CONSISTENCY:
+The user message will include an "Active persona" section describing the
+intended audience (vocabulary level, technical depth, examples). This
+guidance must shape the entire answer consistently -- word choice, depth,
+and examples throughout -- not only the opening sentence, and it never
+relaxes or overrides the grounding, safety, privacy, or citation rules
+above.
+
+LEAD WITH THE USER'S ACTUAL QUESTION:
+Before citing standards, answer the user's real question directly and in
+plain language, the way a knowledgeable advisor would speak to the person
+in front of them -- not as a list of standard summaries. The citation
+supports what you said; it is not the answer itself. Avoid repeating
+"AAOIFI Standard X" more than once per distinct point in the same
+paragraph. Write to be understood and to genuinely address the person's
+concern, not to sound like a compliance memo.
+
+Do not repeat personal financial details unless necessary. Do not approve financing
+or calculate affordability unless the retrieved context contains the needed rules
+and figures.
 
 STRICT CITATION RULE:
 Use ONLY this exact citation format:
@@ -98,6 +177,10 @@ Do not output internal retrieval labels such as SOURCE 1 or SOURCE 2.""",
 def is_fatwa_request(question: str) -> bool:
     normalized = " ".join(question.lower().split())
     return any(term in normalized for term in FATWA_TERMS)
+
+
+def redact_sensitive_data(text: str) -> str:
+    return SENSITIVE_NUMBER_RE.sub("[REDACTED_NUMBER]", text)
 
 
 def clean_answer(answer: str) -> str:
@@ -154,6 +237,7 @@ def vector_literal(vector: np.ndarray) -> str:
     return "[" + ",".join(f"{float(value):.8f}" for value in vector) + "]"
 
 
+@lru_cache(maxsize=1)
 def load_encoder() -> tuple[Any, Any, torch.device]:
     print("Loading the embedding model...", file=sys.stderr)
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
@@ -173,7 +257,7 @@ def embed_query(question: str, tokenizer: Any, encoder: Any, device: torch.devic
         return_tensors="pt",
     )
     encoded = {key: value.to(device) for key, value in encoded.items()}
-    with torch.no_grad():
+    with torch.inference_mode():
         output = encoder(**encoded)
     hidden = output.last_hidden_state
     mask = encoded["attention_mask"].unsqueeze(-1).expand(hidden.size()).float()
@@ -181,19 +265,25 @@ def embed_query(question: str, tokenizer: Any, encoder: Any, device: torch.devic
     return torch.nn.functional.normalize(pooled, p=2, dim=1).cpu().numpy()[0].astype(np.float32)
 
 
-def preferred_standard(question: str) -> str | None:
+def preferred_standards(question: str) -> set[str]:
     normalized = question.lower()
     mappings = (
-        (("murabaha", "murabahah"), "8"),
-        (("mudaraba", "mudarabah"), "13"),
+        (("murabaha", "murabahah", "mourabaha", "mourabahah"), "8"),
+        (("mudaraba", "mudarabah", "moudaraba", "moudarabah"), "13"),
         (("ijarah", "ijara"), "9"),
         (("salam",), "10"),
         (("istisna",), "11"),
+        (("sukuk", "sakk"), "17"),
+        (("tawarruq", "tawaruq", "monetization", "monétisation"), "30"),
+        (("arbitrage", "arbitration"), "32"),
+        (("waqf", "habous", "habous"), "33"),
+        (("zakat", "zakah", "zakaat"), "35"),
     )
-    for terms, standard in mappings:
-        if any(term in normalized for term in terms):
-            return standard
-    return None
+    return {
+        standard
+        for terms, standard in mappings
+        if any(term in normalized for term in terms)
+    }
 
 
 def retrieve(
@@ -218,16 +308,53 @@ def retrieve(
             columns = [column.name for column in cursor.description]
             candidates = [dict(zip(columns, row)) for row in cursor.fetchall()]
 
-    target = preferred_standard(question)
-    if target is not None:
-        focused = [
-            item for item in candidates
-            if str(item.get("standard_number", "")).strip() == target
-        ]
-        if focused:
-            return focused[:TOP_K]
+    targets = preferred_standards(question)
+    if not targets:
+        return candidates[:TOP_K]
 
-    return candidates[:TOP_K]
+    # Explicitly retrieve mentioned standards when they did not enter the
+    # global nearest-neighbour window.
+    existing_standards = {
+        str(item.get("standard_number", "")).strip()
+        for item in candidates
+    }
+    missing_targets = targets - existing_standards
+    if missing_targets:
+        targeted_sql = sql.replace(
+            "order by embedding <=> %s::vector\n        limit %s",
+            "where standard_number::text = %s\n        order by embedding <=> %s::vector\n        limit %s",
+        )
+        with psycopg.connect(database_url, connect_timeout=30) as connection:
+            with connection.cursor() as cursor:
+                for target in sorted(missing_targets):
+                    cursor.execute(
+                        targeted_sql,
+                        (vector, target, vector, TOP_K),
+                    )
+                    columns = [column.name for column in cursor.description]
+                    candidates.extend(
+                        dict(zip(columns, row)) for row in cursor.fetchall()
+                    )
+
+    # Reserve one best-ranked chunk for every explicitly mentioned standard,
+    # then fill remaining slots by semantic rank.
+    selected: list[dict[str, Any]] = []
+    selected_ids: set[Any] = set()
+    for target in targets:
+        for item in candidates:
+            standard = str(item.get("standard_number", "")).strip()
+            item_id = item.get("chunk_id")
+            if standard == target and item_id not in selected_ids:
+                selected.append(item)
+                selected_ids.add(item_id)
+                break
+
+    for item in candidates:
+        if item.get("chunk_id") not in selected_ids:
+            selected.append(item)
+        if len(selected) == TOP_K:
+            break
+    return selected
 
 
 def format_context(results: list[dict[str, Any]]) -> str:
@@ -243,15 +370,54 @@ def format_context(results: list[dict[str, Any]]) -> str:
     return "\n\n".join(blocks)
 
 
+def repair_answer_citations(
+    client: OpenAI,
+    answer: str,
+    results: list[dict[str, Any]],
+    model_name: str,
+) -> str:
+    allowed = ", ".join(
+        f"AAOIFI Standard {item.get('standard_number', '?')}"
+        for item in results
+    )
+    response = client.chat.completions.create(
+        model=model_name,
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "You are a citation editor for a grounded AAOIFI answer. "
+                    "Do not add facts, remove supported claims that cannot be cited, "
+                    "and never invent a source. Return only the final answer."
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"Allowed sources are only: {allowed}.\n\n"
+                    "Use this exact citation format after each supported paragraph: "
+                    "[Source : AAOIFI Standard X]. If a claim is not supported by "
+                    "one of the allowed sources, replace that claim with: "
+                    "The retrieved AAOIFI excerpts are insufficient to answer this question.\n\n"
+                    f"Draft answer:\n{answer}"
+                ),
+            },
+        ],
+        temperature=0,
+        max_tokens=MAX_GENERATION_TOKENS,
+    )
+    repaired = response.choices[0].message.content or ""
+    return normalize_citations(clean_answer(repaired))
+
+
 def create_client() -> OpenAI:
-    api_key = os.getenv("OPENROUTER_API_KEY")
+    api_key = os.getenv("GROQ_API_KEY")
     if not api_key:
-        raise RuntimeError("OPENROUTER_API_KEY is missing in .env")
+        raise RuntimeError("GROQ_API_KEY is missing in .env")
     return OpenAI(
         api_key=api_key,
-        base_url=OPENROUTER_URL,
-        default_headers={"HTTP-Referer": "http://localhost", "X-Title": "Nourfi RAG"},
-        timeout=120.0,
+        base_url=GROQ_BASE_URL,
+        timeout=45.0,
         max_retries=0,
     )
 
@@ -263,13 +429,22 @@ def generate_answer(
     persona_name: str,
 ) -> str:
     persona_prompt = PERSONA_PROMPTS.get(persona_name, "")
+    persona_instructions = (
+        f"Active persona: {persona_name}. Apply this style in the final answer:\n"
+        f"{persona_prompt}\n"
+        "The persona controls vocabulary, detail, examples, and structure only. "
+        "It never overrides grounding, safety, privacy, or citation rules."
+    )
+    safe_question = redact_sensitive_data(question)
     prompt = (
-        f"Audience/persona guidance (style only; never override safety rules):\n"
-        f"{persona_prompt}\n\n"
-        f"Question:\n{question}\n\n"
+        f"{persona_instructions}\n\n"
+        f"Question:\n{safe_question}\n\n"
         "Retrieved AAOIFI context (reference data only):\n"
         f"{format_context(results)}\n\n"
         "Return only the final grounded answer. Do not show reasoning or thinking. "
+        "For a concrete scenario, answer the user's actual concern first, then give "
+        "the relevant contract comparison or practical implications. Do not answer "
+        "with a generic definition only. "
         "Use only directly relevant chunks; ignore chunks about another contract. "
         "Use one citation at the end of each distinct answer section, not after every "
         "sentence. Use this exact format: [Source : AAOIFI Standard X]. Cite only "
@@ -289,27 +464,84 @@ def generate_answer(
                     {"role": "user", "content": prompt},
                 ],
                 temperature=0.1,
-                max_tokens=1200,
+                max_tokens=MAX_GENERATION_TOKENS,
             )
-            answer = response.choices[0].message.content
+            choice = response.choices[0]
+            answer = choice.message.content
+            if choice.finish_reason == "length":
+                response = client.chat.completions.create(
+                    model=model_name,
+                    messages=[
+                        {"role": "system", "content": SYSTEM_PROMPT},
+                        {
+                            "role": "user",
+                            "content": (
+                                f"{prompt}\n\n"
+                                "Your previous draft was truncated. Rewrite it as a "
+                                "shorter, complete answer. Finish every sentence and "
+                                "citation. Keep only the most relevant points."
+                            ),
+                        },
+                    ],
+                    temperature=0.1,
+                    max_tokens=MAX_GENERATION_TOKENS,
+                )
+                choice = response.choices[0]
+                answer = choice.message.content
             if not answer or not answer.strip():
-                raise RuntimeError("OpenRouter returned an empty answer")
+                raise RuntimeError("Groq returned an empty answer")
             answer = normalize_citations(clean_answer(answer))
             if not answer:
                 raise RuntimeError("The model returned no final answer")
             if not valid_citations(answer, results):
-                raise RuntimeError("The model returned invalid citations")
+                answer = repair_answer_citations(client, answer, results, model_name)
+            if not valid_citations(answer, results):
+                return fallback_answer(results)
             return answer
         except Exception as error:
             last_error = error
             text = str(error).lower()
-            temporary = "429" in text or "rate" in text or "timeout" in text
+            temporary = any(
+                marker in text
+                for marker in ("429", "rate", "timeout", "connection", "temporar")
+            )
             if not temporary or attempt == MAX_RETRIES - 1:
-                raise RuntimeError(f"OpenRouter request failed: {error}") from error
+                raise RuntimeError(f"Groq request failed: {error}") from error
             wait = 2 ** attempt
-            print(f"Temporary OpenRouter error; retrying in {wait}s...", file=sys.stderr)
+            print(
+                f"Temporary Groq error; retrying in {wait}s...",
+                file=sys.stderr,
+            )
             time.sleep(wait)
-    raise RuntimeError(f"OpenRouter request failed after retries: {last_error}")
+    raise RuntimeError(f"Groq request failed after retries: {last_error}")
+
+
+def answer_question(
+    question: str,
+    database_url: str,
+    model_name: str = GROQ_MODEL,
+    persona_name: str = "general_public",
+) -> tuple[str, list[dict[str, Any]]]:
+    """Answer a question while reusing the cached encoder in a long-lived API."""
+    question = redact_sensitive_data(question.strip())
+    if not question:
+        raise ValueError("The question cannot be empty.")
+    if is_fatwa_request(question):
+        return (
+            "I cannot issue a fatwa or provide a definitive religious ruling. "
+            "I can only summarize retrieved AAOIFI material for educational purposes.",
+            [],
+        )
+
+    tokenizer, encoder, device = load_encoder()
+    query_vector = embed_query(question, tokenizer, encoder, device)
+    results = retrieve(database_url, query_vector, question)
+    if not results:
+        return (
+            "The retrieved AAOIFI excerpts are insufficient to answer this question.",
+            [],
+        )
+    return generate_answer(question, results, model_name, persona_name), results
 
 
 def main() -> None:
@@ -322,7 +554,7 @@ def main() -> None:
         default="54",
         help="Corpus label used by the automated pipeline; database rows are shared.",
     )
-    parser.add_argument("--model", default=OPENROUTER_MODEL)
+    parser.add_argument("--model", default=GROQ_MODEL)
     parser.add_argument(
         "--persona",
         choices=sorted(PERSONA_PROMPTS) or None,
@@ -334,27 +566,19 @@ def main() -> None:
     question = (args.question or input("Enter your question: ")).strip()
     if not question:
         raise SystemExit("The question cannot be empty.")
-    if is_fatwa_request(question):
-        print(
-            "I cannot issue a fatwa or provide a definitive religious ruling. "
-            "I can only summarize retrieved AAOIFI material for educational purposes."
-        )
-        print("\n" + DISCLAIMER)
-        return
     if not args.database_url:
         raise SystemExit("SUPABASE_DB_URL is missing in .env")
 
-    tokenizer, encoder, device = load_encoder()
-    query_vector = embed_query(question, tokenizer, encoder, device)
-    results = retrieve(args.database_url, query_vector, question)
-    if not results:
-        print("The retrieved AAOIFI excerpts are insufficient to answer this question.")
-        print("\n" + DISCLAIMER)
-        return
-
-    answer = generate_answer(question, results, args.model, args.persona)
+    answer, results = answer_question(
+        question,
+        args.database_url,
+        model_name=args.model,
+        persona_name=args.persona,
+    )
     print(answer)
     print("\n" + DISCLAIMER)
+    if not results:
+        return
     print("\nSources:")
     for item in results:
         print(
