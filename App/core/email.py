@@ -6,10 +6,8 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-GMAIL_ADDRESS = os.getenv("GMAIL_ADDRESS")
-GMAIL_APP_PASSWORD = os.getenv("GMAIL_APP_PASSWORD")
-
-
+GMAIL_ADDRESS = (os.getenv("GMAIL_ADDRESS") or "").strip()
+GMAIL_APP_PASSWORD = (os.getenv("GMAIL_APP_PASSWORD") or "").strip().replace(" ", "")
 def send_email(to_email: str, subject: str, html_content: str):
     msg = MIMEMultipart("alternative")
     msg["Subject"] = subject

@@ -1,23 +1,50 @@
-from fastapi import FastAPI, Depends, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy.orm import Session
-from pydantic import BaseModel, EmailStr
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
+import os
+import random
 import secrets
 import uuid
-import random
+
+# Load environment variables early
+from dotenv import load_dotenv
+load_dotenv()
+
+from fastapi import Depends, FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, EmailStr
+from sqlalchemy.orm import Session
+
+# Core & App Imports
 from App.core.database import get_db
-from App.core.security import hash_password, verify_password, create_access_token
-from App.core.encryption import encrypt_value, decrypt_value
 from App.core.email import send_reset_password_email, send_verification_email
-from App.models.user import User
-from App.models.financial_profile import FinancialProfile
+from App.core.encryption import decrypt_value, encrypt_value
+from App.core.security import create_access_token, hash_password, verify_password
+
+# Models
 from App.models.conversation import Conversation
+from App.models.email_verification_code import EmailVerificationCode
+from App.models.financial_profile import FinancialProfile
 from App.models.message import Message
 from App.models.password_reset_token import PasswordResetToken
-from App.models.email_verification_code import EmailVerificationCode
+from App.models.user import User
 
-app = FastAPI()
+# AI RAG Imports
+from App.AI_RAG.rag.pipeline import load_encoder, answer_question, summarize_conversation, DISCLAIMER
+
+# ------------------------------------------------------------------------------
+# 1. LIFESPAN & GLOBAL AI MODEL STORAGE
+# ------------------------------------------------------------------------------
+ml_models = {}
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    print("Loading AI models into memory...")
+    load_encoder()  # chauffe le cache, résultat ignoré ici volontairement
+    yield
+# ------------------------------------------------------------------------------
+# 2. APP INITIALIZATION & CORS
+# ------------------------------------------------------------------------------
+app = FastAPI(lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -26,23 +53,90 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
 @app.get("/")
 def read_root():
     return {"status": "backend is running"}
 
+
+# ------------------------------------------------------------------------------
+# 3. PYDANTIC SCHEMAS (Defined before route references)
+# ------------------------------------------------------------------------------
 class RegisterRequest(BaseModel):
     name: str
     email: EmailStr
     password: str
+
 class LoginRequest(BaseModel):
     email: EmailStr
     password: str
+
 class VerifyEmailRequest(BaseModel):
     email: EmailStr
     code: str
 
 class ResendCodeRequest(BaseModel):
     email: EmailStr
+
+class ForgotPasswordRequest(BaseModel):
+    email: EmailStr
+
+class ResetPasswordRequest(BaseModel):
+    token: str
+    new_password: str
+
+class FinancialProfileRequest(BaseModel):
+    user_id: str
+    family_stat: str | None = None
+    job: str | None = None
+    income: float | None = None
+    investments: float | None = None
+    postal_code: str | None = None
+    credit: float | None = None
+
+class ProfileUpdateRequest(BaseModel):
+    age: int | None = None
+    family_stat: str | None = None
+    job: str | None = None
+    income: float | None = None
+    has_down_payment: bool | None = None
+    down_payment: float | None = None
+    has_loans: bool | None = None
+    credit: float | None = None
+    maingoal: str | None = None
+    knowledgelvl: str | None = None
+    ethical_priorities: list[str] = []
+    networth: float | None = None
+
+class OnboardingSubmitRequest(BaseModel):
+    user_id: str
+    age: int | None = None
+    situationFamiliale: str | None = None
+    profession: str | None = None
+    revenuMensuel: float | None = None
+    apportInitial: str | None = None
+    montantApport: float | None = None
+    montantCredit: float | None = None
+    financementsEnCours: str | None = None
+    objectifPrincipal: str | None = None
+    niveauConnaissance: str | None = None
+    prioritesEthiques: list[str] = []
+    patrimoineEstime: float | None = None
+
+class CreateConversationRequest(BaseModel):
+    user_id: str
+    title: str
+
+class SendMessageRequest(BaseModel):
+    conv_id: str
+    content: str
+    sender: str
+
+
+# ------------------------------------------------------------------------------
+# 4. HELPER FUNCTIONS
+# ------------------------------------------------------------------------------
 def generate_and_send_code(user, db):
     code = str(random.randint(100000, 999999))
     code_row = EmailVerificationCode(
@@ -55,6 +149,11 @@ def generate_and_send_code(user, db):
     db.add(code_row)
     db.commit()
     send_verification_email(user.email, code)
+
+
+# ------------------------------------------------------------------------------
+# 5. AUTH ENDPOINTS
+# ------------------------------------------------------------------------------
 @app.post("/api/v1/auth/register")
 def register(payload: RegisterRequest, db: Session = Depends(get_db)):
     existing_user = db.query(User).filter(User.email == payload.email).first()
@@ -75,6 +174,7 @@ def register(payload: RegisterRequest, db: Session = Depends(get_db)):
     generate_and_send_code(new_user, db)
     token = create_access_token({"sub": new_user.user_id})
     return {"access_token": token, "token_type": "bearer"}
+
 @app.post("/api/v1/auth/login")
 def login(payload: LoginRequest, db: Session = Depends(get_db)):
     user = db.query(User).filter(User.email == payload.email).first()
@@ -84,6 +184,7 @@ def login(payload: LoginRequest, db: Session = Depends(get_db)):
         raise HTTPException(status_code=403, detail="Veuillez vérifier votre adresse e-mail avant de vous connecter.")
     token = create_access_token({"sub": user.user_id})
     return {"access_token": token, "token_type": "bearer"}
+
 @app.post("/api/v1/auth/verify-email")
 def verify_email(payload: VerifyEmailRequest, db: Session = Depends(get_db)):
     user = db.query(User).filter(User.email == payload.email).first()
@@ -100,6 +201,7 @@ def verify_email(payload: VerifyEmailRequest, db: Session = Depends(get_db)):
     code_row.used = True
     db.commit()
     return {"message": "E-mail vérifié avec succès."}
+
 @app.post("/api/v1/auth/resend-code")
 def resend_code(payload: ResendCodeRequest, db: Session = Depends(get_db)):
     user = db.query(User).filter(User.email == payload.email).first()
@@ -107,11 +209,6 @@ def resend_code(payload: ResendCodeRequest, db: Session = Depends(get_db)):
         generate_and_send_code(user, db)
     return {"message": "Si votre compte existe et n'est pas vérifié, un nouveau code a été envoyé."}
 
-class ForgotPasswordRequest(BaseModel):
-    email: EmailStr
-class ResetPasswordRequest(BaseModel):
-    token: str
-    new_password: str
 @app.post("/api/v1/auth/forgot-password")
 def forgot_password(payload: ForgotPasswordRequest, db: Session = Depends(get_db)):
     user = db.query(User).filter(User.email == payload.email).first()
@@ -129,6 +226,7 @@ def forgot_password(payload: ForgotPasswordRequest, db: Session = Depends(get_db
     db.commit()
     send_reset_password_email(user.email, reset_token)
     return {"message": "un lien de réinitialisation a été envoyé."}
+
 @app.post("/api/v1/auth/reset-password")
 def reset_password(payload: ResetPasswordRequest, db: Session = Depends(get_db)):
     token_row = db.query(PasswordResetToken).filter(
@@ -141,14 +239,11 @@ def reset_password(payload: ResetPasswordRequest, db: Session = Depends(get_db))
     token_row.used = True
     db.commit()
     return {"message": "Mot de passe réinitialisé avec succès."}
-class FinancialProfileRequest(BaseModel):
-    user_id: str
-    family_stat: str | None = None
-    job: str | None = None
-    income: float | None = None
-    investments: float | None = None
-    postal_code: str | None = None
-    credit: float | None = None
+
+
+# ------------------------------------------------------------------------------
+# 6. PROFILE ENDPOINTS
+# ------------------------------------------------------------------------------
 @app.post("/api/v1/profile/financial")
 def create_financial_profile(payload: FinancialProfileRequest, db: Session = Depends(get_db)):
     new_profile = FinancialProfile(
@@ -164,6 +259,7 @@ def create_financial_profile(payload: FinancialProfileRequest, db: Session = Dep
     db.add(new_profile)
     db.commit()
     return {"status": "profile saved", "financial_id": new_profile.financial_id}
+
 @app.get("/api/v1/profile/financial/{financial_id}")
 def get_financial_profile(financial_id: str, db: Session = Depends(get_db)):
     profile = db.query(FinancialProfile).filter(FinancialProfile.financial_id == financial_id).first()
@@ -179,6 +275,7 @@ def get_financial_profile(financial_id: str, db: Session = Depends(get_db)):
         "postal_code": decrypt_value(profile.postal_code),
         "credit": decrypt_value(profile.credit),
     }
+
 @app.get("/api/v1/profile/{user_id}")
 def get_user_profile(user_id: str, db: Session = Depends(get_db)):
     user = db.query(User).filter(User.user_id == user_id).first()
@@ -201,19 +298,7 @@ def get_user_profile(user_id: str, db: Session = Depends(get_db)):
         "ethical_priorities": financial.ethical_priorities.split(",") if financial and financial.ethical_priorities else [],
         "networth": decrypt_value(financial.networth) if financial and financial.networth else None,
     }
-class ProfileUpdateRequest(BaseModel):
-    age: int | None = None
-    family_stat: str | None = None
-    job: str | None = None
-    income: float | None = None
-    has_down_payment: bool | None = None
-    down_payment: float | None = None
-    has_loans: bool | None = None
-    credit: float | None = None
-    maingoal: str | None = None
-    knowledgelvl: str | None = None
-    ethical_priorities: list[str] = []
-    networth: float | None = None
+
 @app.put("/api/v1/profile/{user_id}")
 def update_profile(user_id: str, payload: ProfileUpdateRequest, db: Session = Depends(get_db)):
     user = db.query(User).filter(User.user_id == user_id).first()
@@ -238,20 +323,7 @@ def update_profile(user_id: str, payload: ProfileUpdateRequest, db: Session = De
     financial.networth = encrypt_value(payload.networth)
     db.commit()
     return {"status": "profile updated"}
-class OnboardingSubmitRequest(BaseModel):
-    user_id: str
-    age: int | None = None
-    situationFamiliale: str | None = None
-    profession: str | None = None
-    revenuMensuel: float | None = None
-    apportInitial: str | None = None
-    montantApport: float | None = None
-    montantCredit: float | None = None
-    financementsEnCours: str | None = None
-    objectifPrincipal: str | None = None
-    niveauConnaissance: str | None = None
-    prioritesEthiques: list[str] = []
-    patrimoineEstime: float | None = None
+
 @app.post("/api/v1/consultation/submit")
 def submit_onboarding(payload: OnboardingSubmitRequest, db: Session = Depends(get_db)):
     user = db.query(User).filter(User.user_id == payload.user_id).first()
@@ -259,26 +331,28 @@ def submit_onboarding(payload: OnboardingSubmitRequest, db: Session = Depends(ge
         raise HTTPException(status_code=404, detail="User not found")
     user.age = payload.age
     new_profile = FinancialProfile(
-    financial_id=str(uuid.uuid4()),
-    user_id=payload.user_id,
-    family_stat=payload.situationFamiliale,
-    job=payload.profession,
-    income=encrypt_value(payload.revenuMensuel),
-     has_down_payment=(payload.apportInitial == "Oui"),
-     down_payment=encrypt_value(payload.montantApport),
-     has_loans=(payload.financementsEnCours == "Oui"),
-    credit=encrypt_value(payload.montantCredit),
-    maingoal=payload.objectifPrincipal,
-    knowledgelvl=payload.niveauConnaissance,
-    ethical_priorities=",".join(payload.prioritesEthiques),
-    networth=encrypt_value(payload.patrimoineEstime),
+        financial_id=str(uuid.uuid4()),
+        user_id=payload.user_id,
+        family_stat=payload.situationFamiliale,
+        job=payload.profession,
+        income=encrypt_value(payload.revenuMensuel),
+        has_down_payment=(payload.apportInitial == "Oui"),
+        down_payment=encrypt_value(payload.montantApport),
+        has_loans=(payload.financementsEnCours == "Oui"),
+        credit=encrypt_value(payload.montantCredit),
+        maingoal=payload.objectifPrincipal,
+        knowledgelvl=payload.niveauConnaissance,
+        ethical_priorities=",".join(payload.prioritesEthiques),
+        networth=encrypt_value(payload.patrimoineEstime),
     )
     db.add(new_profile)
     db.commit()
     return {"status": "profile saved", "financial_id": new_profile.financial_id}
-class CreateConversationRequest(BaseModel):
-    user_id: str
-    title: str
+
+
+# ------------------------------------------------------------------------------
+# 7. CHAT & RAG ENDPOINTS
+# ------------------------------------------------------------------------------
 @app.post("/api/v1/chat/conversations")
 def create_conversation(payload: CreateConversationRequest, db: Session = Depends(get_db)):
     new_conv = Conversation(
@@ -291,19 +365,160 @@ def create_conversation(payload: CreateConversationRequest, db: Session = Depend
     db.commit()
     return {"conv_id": new_conv.conv_id, "title": new_conv.title}
 
-class SendMessageRequest(BaseModel):
-    conv_id: str
-    content: str
-    sender: str
+
+"""
+Remplace TOUT le bloc, depuis le premier "SUMMARY_FREQUENCY = 10" jusqu'à
+la fin de send_message(), par ce qui suit. Corrige 2 choses :
+1. AJOUTE RAG_DATABASE_URL (variable manquante — cause un NameError actuellement)
+2. SUPPRIME les définitions dupliquées (SUMMARY_FREQUENCY, RECENT_MESSAGES_LIMIT,
+   detect_persona, get_recent_messages n'apparaissaient chacun qu'une fois avant,
+   maintenant deux fois dans ton fichier)
+"""
+
+import time
+
+# NOUVEAU — manquait, cause un NameError dans send_message() sans ça
+RAG_DATABASE_URL = (
+    os.getenv("SUPABASE_DATABASE_URL")
+    or os.getenv("SUPABASE_DB_URL")
+    or os.getenv("DATABASE_URL")
+)
+
+SUMMARY_FREQUENCY = 10
+RECENT_MESSAGES_LIMIT = 4
+MAX_MESSAGE_CHARS = 600
+MIN_SECONDS_BETWEEN_GROQ_CALLS = 2.0
+
+_last_groq_call_time = 0.0
+
+
+def throttle_groq_calls():
+    """Espace les appels Groq d'au moins MIN_SECONDS_BETWEEN_GROQ_CALLS."""
+    global _last_groq_call_time
+    elapsed = time.monotonic() - _last_groq_call_time
+    if elapsed < MIN_SECONDS_BETWEEN_GROQ_CALLS:
+        time.sleep(MIN_SECONDS_BETWEEN_GROQ_CALLS - elapsed)
+    _last_groq_call_time = time.monotonic()
+
+
+def detect_persona(financial_profile) -> str:
+    """Mapping basé sur la profession déclarée à l'inscription (Step1.jsx)."""
+    if not financial_profile or not financial_profile.job:
+        return "general_public"
+    profession = financial_profile.job.strip()
+    mapping = {
+        "Entrepreneur": "entrepreneur",
+        "Étudiant": "student",
+        "Spécialiste finance": "finance_specialist",
+        "Banquier": "banker",
+        "Chef d'entreprise": "business_owner",
+        "Investisseur": "investor",
+        "Universitaire": "academic",
+        # "Ouvrier" et "Autre" -> general_public
+    }
+    return mapping.get(profession, "general_public")
+
+
+def get_recent_messages(history: list, limit: int = 10, max_chars: int = MAX_MESSAGE_CHARS) -> list:
+    """Tronque chaque message à max_chars avant de le renvoyer."""
+    trimmed = history[-limit:]
+    return [{**m, "content": m["content"][:max_chars]} for m in trimmed]
+
+
 @app.post("/api/v1/chat/messages")
 def send_message(payload: SendMessageRequest, db: Session = Depends(get_db)):
-    new_msg = Message(
+    user_msg = Message(
         msg_id=str(uuid.uuid4()),
         conv_id=payload.conv_id,
         content=payload.content,
-        sender=payload.sender,
+        sender="user",
         timestamp=datetime.utcnow(),
     )
-    db.add(new_msg)
+    db.add(user_msg)
     db.commit()
-    return {"msg_id": new_msg.msg_id, "content": new_msg.content, "sender": new_msg.sender}
+
+    conversation = db.query(Conversation).filter(Conversation.conv_id == payload.conv_id).first()
+    if not conversation:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+
+    financial = (
+        db.query(FinancialProfile)
+        .filter(FinancialProfile.user_id == conversation.user_id)
+        .first()
+    )
+    persona_key = detect_persona(financial)
+
+    prior_messages = (
+        db.query(Message)
+        .filter(Message.conv_id == payload.conv_id, Message.msg_id != user_msg.msg_id)
+        .order_by(Message.timestamp)
+        .all()
+    )
+    recent = get_recent_messages(
+        [{"role": m.sender, "content": m.content} for m in prior_messages],
+        RECENT_MESSAGES_LIMIT,
+    )
+
+    throttle_groq_calls()
+    try:
+        answer, results = answer_question(
+            question=payload.content,
+            database_url=RAG_DATABASE_URL,
+            persona_name=persona_key,
+            conversation_summary=conversation.summary,
+            recent_messages=recent,
+        )
+    except RuntimeError as error:
+        error_text = str(error).lower()
+        if "429" in error_text or "rate_limit" in error_text or "rate limit" in error_text:
+            answer = (
+                "Le service est momentanément très sollicité. "
+                "Merci de réessayer dans quelques secondes."
+            )
+        else:
+            answer = "Une erreur est survenue lors de la génération de la réponse. Réessayez."
+        results = []
+
+    sources = [
+        {
+            "standard_number": item.get("standard_number"),
+            "title": item.get("standard_title"),
+            "pages": f"{item.get('page_start')}-{item.get('page_end')}",
+        }
+        for item in results
+    ]
+
+    assistant_msg = Message(
+        msg_id=str(uuid.uuid4()),
+        conv_id=payload.conv_id,
+        content=answer,
+        sender="assistant",
+        timestamp=datetime.utcnow(),
+    )
+    db.add(assistant_msg)
+    db.commit()
+
+    all_messages = (
+        db.query(Message)
+        .filter(Message.conv_id == payload.conv_id)
+        .order_by(Message.timestamp)
+        .all()
+    )
+    if len(all_messages) > 0 and len(all_messages) % SUMMARY_FREQUENCY == 0:
+        recent_for_summary = get_recent_messages(
+            [{"role": m.sender, "content": m.content} for m in all_messages], 10
+        )
+        try:
+            throttle_groq_calls()
+            conversation.summary = summarize_conversation(conversation.summary, recent_for_summary)
+            db.commit()
+        except RuntimeError:
+            pass
+
+    return {
+        "msg_id": assistant_msg.msg_id,
+        "content": assistant_msg.content,
+        "sender": assistant_msg.sender,
+        "disclaimer": DISCLAIMER,
+        "sources": sources,
+    }
