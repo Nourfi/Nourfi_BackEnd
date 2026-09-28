@@ -3,14 +3,17 @@ from datetime import datetime, timedelta
 import os
 import random
 import secrets
+import time
 import uuid
 
 # Load environment variables early
 from dotenv import load_dotenv
 load_dotenv()
 
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import OAuth2PasswordBearer
+from jose import jwt, JWTError
 from pydantic import BaseModel, EmailStr
 from sqlalchemy.orm import Session
 
@@ -18,7 +21,7 @@ from sqlalchemy.orm import Session
 from App.core.database import get_db
 from App.core.email import send_reset_password_email, send_verification_email
 from App.core.encryption import decrypt_value, encrypt_value
-from App.core.security import create_access_token, hash_password, verify_password
+from App.core.security import create_access_token, hash_password, verify_password, SECRET_KEY, ALGORITHM
 
 # Models
 from App.models.conversation import Conversation
@@ -28,19 +31,91 @@ from App.models.message import Message
 from App.models.password_reset_token import PasswordResetToken
 from App.models.user import User
 
-# AI RAG Imports
-from App.AI_RAG.rag.pipeline import load_encoder, answer_question, summarize_conversation, DISCLAIMER
+# AI RAG Imports (Syntaxe corrigée)
+from App.AI_RAG.rag.pipeline import (
+    load_encoder,
+    answer_question,
+    summarize_conversation,
+    redact_sensitive_data,
+    DISCLAIMER,
+)
 
 # ------------------------------------------------------------------------------
-# 1. LIFESPAN & GLOBAL AI MODEL STORAGE
+# 0. CONFIG — base RAG + mémoire
 # ------------------------------------------------------------------------------
-ml_models = {}
+def resolve_rag_database_url():
+    """Base Supabase (table rag_chunks). Renvoie (url, nom_de_la_variable)."""
+    for name in ("SUPABASE_DATABASE_URL", "SUPABASE_DB_URL", "DATABASE_URL"):
+        value = os.getenv(name)
+        if value:
+            return value, name
+    return None, None
 
+RAG_DATABASE_URL, RAG_DATABASE_URL_SOURCE = resolve_rag_database_url()
+
+# Mémoire DANS une conversation
+SUMMARY_FREQUENCY = 10                  # résumé mis à jour tous les N messages
+RECENT_MESSAGES_LIMIT = 4               # derniers messages bruts envoyés au LLM
+MAX_MESSAGE_CHARS = 600                 # troncature par message dans l'historique
+MIN_SECONDS_BETWEEN_GROQ_CALLS = 2.0
+
+# Mémoire ENTRE conversations
+CROSS_CONV_MAX_CONVERSATIONS = 3        # nb de conversations passées utilisées
+CROSS_CONV_DIGEST_QUESTIONS = 3         # si pas de résumé : nb de questions gardées
+CROSS_CONV_QUESTION_CHARS = 160         # troncature de chaque question
+CROSS_CONV_MAX_CHARS = 1200             # plafond total du contexte injecté
+
+# ------------------------------------------------------------------------------
+# AUTH — get_current_user (Member 1)
+# ------------------------------------------------------------------------------
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/v1/auth/login")
+
+def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)):
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Could not validate credentials",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        user_id: str = payload.get("sub")
+        if user_id is None:
+            print("[JWT Auth Error] Field 'sub' is missing from payload")
+            raise credentials_exception
+    except JWTError as e:
+        print(f"[JWT Auth Error] Validation failed: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=f"Invalid authentication token: {str(e)}",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    user = db.query(User).filter(User.user_id == user_id).first()
+    if user is None:
+        print(f"[JWT Auth Error] User with id {user_id} not found in database")
+        raise HTTPException(status_code=404, detail="User no longer exists in database")
+    return user
+
+# ------------------------------------------------------------------------------
+# 1. LIFESPAN
+# ------------------------------------------------------------------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     print("Loading AI models into memory...")
-    load_encoder()  # chauffe le cache, résultat ignoré ici volontairement
+    try:
+        load_encoder()
+    except Exception as e:
+        print(f"[Warning] Could not preload encoder: {e}")
+        
+    print(f"RAG database source: {RAG_DATABASE_URL_SOURCE or 'NOT CONFIGURED'}")
+    if RAG_DATABASE_URL_SOURCE == "DATABASE_URL":
+        print(
+            "[WARNING] Le RAG utilise DATABASE_URL (souvent la base LOCALE de l'app, sans "
+            "table rag_chunks). Définis SUPABASE_DB_URL dans .env si tu vois "
+            "'relation rag_chunks does not exist'."
+        )
     yield
+
 # ------------------------------------------------------------------------------
 # 2. APP INITIALIZATION & CORS
 # ------------------------------------------------------------------------------
@@ -48,20 +123,18 @@ app = FastAPI(lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173"],
+    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-
 @app.get("/")
 def read_root():
     return {"status": "backend is running"}
 
-
 # ------------------------------------------------------------------------------
-# 3. PYDANTIC SCHEMAS (Defined before route references)
+# 3. PYDANTIC SCHEMAS
 # ------------------------------------------------------------------------------
 class RegisterRequest(BaseModel):
     name: str
@@ -125,14 +198,12 @@ class OnboardingSubmitRequest(BaseModel):
     patrimoineEstime: float | None = None
 
 class CreateConversationRequest(BaseModel):
-    user_id: str
     title: str
 
 class SendMessageRequest(BaseModel):
     conv_id: str
     content: str
-    sender: str
-
+    sender: str = "user"
 
 # ------------------------------------------------------------------------------
 # 4. HELPER FUNCTIONS
@@ -149,7 +220,6 @@ def generate_and_send_code(user, db):
     db.add(code_row)
     db.commit()
     send_verification_email(user.email, code)
-
 
 # ------------------------------------------------------------------------------
 # 5. AUTH ENDPOINTS
@@ -239,7 +309,6 @@ def reset_password(payload: ResetPasswordRequest, db: Session = Depends(get_db))
     token_row.used = True
     db.commit()
     return {"message": "Mot de passe réinitialisé avec succès."}
-
 
 # ------------------------------------------------------------------------------
 # 6. PROFILE ENDPOINTS
@@ -349,48 +418,10 @@ def submit_onboarding(payload: OnboardingSubmitRequest, db: Session = Depends(ge
     db.commit()
     return {"status": "profile saved", "financial_id": new_profile.financial_id}
 
-
 # ------------------------------------------------------------------------------
-# 7. CHAT & RAG ENDPOINTS
+# 7. CHAT & RAG
 # ------------------------------------------------------------------------------
-@app.post("/api/v1/chat/conversations")
-def create_conversation(payload: CreateConversationRequest, db: Session = Depends(get_db)):
-    new_conv = Conversation(
-        conv_id=str(uuid.uuid4()),
-        user_id=payload.user_id,
-        title=payload.title,
-        created_at=datetime.utcnow(),
-    )
-    db.add(new_conv)
-    db.commit()
-    return {"conv_id": new_conv.conv_id, "title": new_conv.title}
-
-
-"""
-Remplace TOUT le bloc, depuis le premier "SUMMARY_FREQUENCY = 10" jusqu'à
-la fin de send_message(), par ce qui suit. Corrige 2 choses :
-1. AJOUTE RAG_DATABASE_URL (variable manquante — cause un NameError actuellement)
-2. SUPPRIME les définitions dupliquées (SUMMARY_FREQUENCY, RECENT_MESSAGES_LIMIT,
-   detect_persona, get_recent_messages n'apparaissaient chacun qu'une fois avant,
-   maintenant deux fois dans ton fichier)
-"""
-
-import time
-
-# NOUVEAU — manquait, cause un NameError dans send_message() sans ça
-RAG_DATABASE_URL = (
-    os.getenv("SUPABASE_DATABASE_URL")
-    or os.getenv("SUPABASE_DB_URL")
-    or os.getenv("DATABASE_URL")
-)
-
-SUMMARY_FREQUENCY = 10
-RECENT_MESSAGES_LIMIT = 4
-MAX_MESSAGE_CHARS = 600
-MIN_SECONDS_BETWEEN_GROQ_CALLS = 2.0
-
 _last_groq_call_time = 0.0
-
 
 def throttle_groq_calls():
     """Espace les appels Groq d'au moins MIN_SECONDS_BETWEEN_GROQ_CALLS."""
@@ -400,9 +431,8 @@ def throttle_groq_calls():
         time.sleep(MIN_SECONDS_BETWEEN_GROQ_CALLS - elapsed)
     _last_groq_call_time = time.monotonic()
 
-
 def detect_persona(financial_profile) -> str:
-    """Mapping basé sur la profession déclarée à l'inscription (Step1.jsx)."""
+    """Persona déduit de la profession déclarée à l'inscription (Step1.jsx)."""
     if not financial_profile or not financial_profile.job:
         return "general_public"
     profession = financial_profile.job.strip()
@@ -414,61 +444,183 @@ def detect_persona(financial_profile) -> str:
         "Chef d'entreprise": "business_owner",
         "Investisseur": "investor",
         "Universitaire": "academic",
-        # "Ouvrier" et "Autre" -> general_public
     }
     return mapping.get(profession, "general_public")
 
-
 def get_recent_messages(history: list, limit: int = 10, max_chars: int = MAX_MESSAGE_CHARS) -> list:
-    """Tronque chaque message à max_chars avant de le renvoyer."""
+    """Derniers messages, données sensibles masquées PUIS tronquées."""
     trimmed = history[-limit:]
-    return [{**m, "content": m["content"][:max_chars]} for m in trimmed]
+    return [
+        {**m, "content": redact_sensitive_data(m["content"])[:max_chars]}
+        for m in trimmed
+    ]
 
+def build_cross_conversation_context(db: Session, user_id: str, current_conv_id: str) -> str | None:
+    """Mémoire ENTRE conversations : condensé des conversations précédentes du même utilisateur."""
+    past_conversations = (
+        db.query(Conversation)
+        .filter(Conversation.user_id == user_id, Conversation.conv_id != current_conv_id)
+        .order_by(Conversation.created_at.desc())
+        .limit(CROSS_CONV_MAX_CONVERSATIONS)
+        .all()
+    )
+
+    blocks = []
+    for conv in past_conversations:
+        if conv.summary and conv.summary.strip():
+            body = conv.summary.strip()
+        else:
+            user_messages = (
+                db.query(Message)
+                .filter(Message.conv_id == conv.conv_id, Message.sender == "user")
+                .order_by(Message.timestamp.desc())
+                .limit(CROSS_CONV_DIGEST_QUESTIONS)
+                .all()
+            )
+            questions = [m.content[:CROSS_CONV_QUESTION_CHARS] for m in reversed(user_messages)]
+            if not questions:
+                continue
+            body = "questions posées : " + " | ".join(questions)
+        blocks.append(f"- « {conv.title or 'sans titre'} » — {body}")
+
+    if not blocks:
+        return None
+    return redact_sensitive_data("\n".join(blocks))[:CROSS_CONV_MAX_CHARS]
+
+def get_owned_conversation(db: Session, conv_id: str, current_user: User) -> Conversation:
+    """Vérifie que la conversation existe ET appartient à l'utilisateur connecté."""
+    conversation = db.query(Conversation).filter(Conversation.conv_id == conv_id).first()
+    if not conversation:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    if conversation.user_id != current_user.user_id:
+        raise HTTPException(status_code=403, detail="Not authorized for this conversation")
+    return conversation
+
+@app.post("/api/v1/chat/conversations")
+def create_conversation(
+    payload: CreateConversationRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    new_conv = Conversation(
+        conv_id=str(uuid.uuid4()),
+        user_id=current_user.user_id,
+        title=payload.title,
+        created_at=datetime.utcnow(),
+    )
+    db.add(new_conv)
+    db.commit()
+    return {"conv_id": new_conv.conv_id, "title": new_conv.title}
+
+@app.get("/api/v1/chat/conversations")
+def list_conversations(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    conversations = (
+        db.query(Conversation)
+        .filter(Conversation.user_id == current_user.user_id)
+        .order_by(Conversation.created_at.desc())
+        .all()
+    )
+    return [
+        {"conv_id": c.conv_id, "title": c.title, "created_at": c.created_at}
+        for c in conversations
+    ]
+
+@app.get("/api/v1/chat/conversations/{conv_id}/messages")
+def get_conversation_messages(
+    conv_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    conversation = get_owned_conversation(db, conv_id, current_user)
+    messages = (
+        db.query(Message)
+        .filter(Message.conv_id == conversation.conv_id)
+        .order_by(Message.timestamp.asc())
+        .all()
+    )
+    return [
+        {"msg_id": m.msg_id, "content": m.content, "sender": m.sender, "timestamp": m.timestamp}
+        for m in messages
+    ]
 
 @app.post("/api/v1/chat/messages")
-def send_message(payload: SendMessageRequest, db: Session = Depends(get_db)):
+def send_message(
+    payload: SendMessageRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    content = payload.content.strip()
+    if not content:
+        raise HTTPException(status_code=400, detail="Message vide.")
+
+    # 1. Vérification ownership conversation
+    conversation = get_owned_conversation(db, payload.conv_id, current_user)
+
+    # 2. Sauvegarde du message utilisateur
     user_msg = Message(
         msg_id=str(uuid.uuid4()),
-        conv_id=payload.conv_id,
-        content=payload.content,
+        conv_id=conversation.conv_id,
+        content=content,
         sender="user",
         timestamp=datetime.utcnow(),
     )
     db.add(user_msg)
     db.commit()
 
-    conversation = db.query(Conversation).filter(Conversation.conv_id == payload.conv_id).first()
-    if not conversation:
-        raise HTTPException(status_code=404, detail="Conversation not found")
-
+    # 3. Préparation du contexte AI
     financial = (
         db.query(FinancialProfile)
-        .filter(FinancialProfile.user_id == conversation.user_id)
+        .filter(FinancialProfile.user_id == current_user.user_id)
         .first()
     )
     persona_key = detect_persona(financial)
 
     prior_messages = (
         db.query(Message)
-        .filter(Message.conv_id == payload.conv_id, Message.msg_id != user_msg.msg_id)
-        .order_by(Message.timestamp)
+        .filter(Message.conv_id == conversation.conv_id, Message.msg_id != user_msg.msg_id)
+        .order_by(Message.timestamp.desc())
+        .limit(RECENT_MESSAGES_LIMIT)
         .all()
     )
+    prior_messages.reverse()
     recent = get_recent_messages(
         [{"role": m.sender, "content": m.content} for m in prior_messages],
         RECENT_MESSAGES_LIMIT,
     )
 
+    cross_conversation_context = build_cross_conversation_context(
+        db, current_user.user_id, conversation.conv_id
+    )
+
+    # 4. Appel au Pipeline RAG
+    failed = False
     throttle_groq_calls()
     try:
-        answer, results = answer_question(
-            question=payload.content,
-            database_url=RAG_DATABASE_URL,
-            persona_name=persona_key,
-            conversation_summary=conversation.summary,
-            recent_messages=recent,
-        )
-    except RuntimeError as error:
+        # Tente de passer le cross_conversation_context au pipeline
+        try:
+            answer, results = answer_question(
+                question=content,
+                database_url=RAG_DATABASE_URL,
+                persona_name=persona_key,
+                conversation_summary=conversation.summary,
+                recent_messages=recent,
+                cross_conversation_context=cross_conversation_context,
+            )
+        except TypeError:
+            # Fallback si answer_question dans pipeline.py n'accepte pas encore cross_conversation_context
+            answer, results = answer_question(
+                question=content,
+                database_url=RAG_DATABASE_URL,
+                persona_name=persona_key,
+                conversation_summary=conversation.summary,
+                recent_messages=recent,
+            )
+    except Exception as error:
+        failed = True
+        print(f"[RAG error] {type(error).__name__}: {error}")
         error_text = str(error).lower()
         if "429" in error_text or "rate_limit" in error_text or "rate limit" in error_text:
             answer = (
@@ -476,8 +628,12 @@ def send_message(payload: SendMessageRequest, db: Session = Depends(get_db)):
                 "Merci de réessayer dans quelques secondes."
             )
         else:
-            answer = "Une erreur est survenue lors de la génération de la réponse. Réessayez."
+            answer = "Une erreur est survenue lors de la génération de la réponse. Réessaie."
         results = []
+
+    if not failed and (not answer or not answer.strip()):
+        failed = True
+        answer = "Je n'ai pas réussi à formuler une réponse. Peux-tu reformuler ta question ?"
 
     sources = [
         {
@@ -488,37 +644,50 @@ def send_message(payload: SendMessageRequest, db: Session = Depends(get_db)):
         for item in results
     ]
 
-    assistant_msg = Message(
-        msg_id=str(uuid.uuid4()),
-        conv_id=payload.conv_id,
-        content=answer,
-        sender="assistant",
-        timestamp=datetime.utcnow(),
-    )
-    db.add(assistant_msg)
-    db.commit()
-
-    all_messages = (
-        db.query(Message)
-        .filter(Message.conv_id == payload.conv_id)
-        .order_by(Message.timestamp)
-        .all()
-    )
-    if len(all_messages) > 0 and len(all_messages) % SUMMARY_FREQUENCY == 0:
-        recent_for_summary = get_recent_messages(
-            [{"role": m.sender, "content": m.content} for m in all_messages], 10
+    # 5. Enregistrement message assistant
+    assistant_msg = None
+    if not failed:
+        assistant_msg = Message(
+            msg_id=str(uuid.uuid4()),
+            conv_id=conversation.conv_id,
+            content=answer,
+            sender="assistant",
+            timestamp=datetime.utcnow(),
         )
-        try:
-            throttle_groq_calls()
-            conversation.summary = summarize_conversation(conversation.summary, recent_for_summary)
-            db.commit()
-        except RuntimeError:
-            pass
+        db.add(assistant_msg)
+        db.commit()
+
+        # 6. Mise à jour du résumé si le palier est atteint
+        message_count = (
+            db.query(Message).filter(Message.conv_id == conversation.conv_id).count()
+        )
+        if (
+            message_count >= SUMMARY_FREQUENCY
+            and message_count // SUMMARY_FREQUENCY > (message_count - 2) // SUMMARY_FREQUENCY
+        ):
+            try:
+                last_messages = (
+                    db.query(Message)
+                    .filter(Message.conv_id == conversation.conv_id)
+                    .order_by(Message.timestamp.desc())
+                    .limit(10)
+                    .all()
+                )
+                last_messages.reverse()
+                recent_for_summary = get_recent_messages(
+                    [{"role": m.sender, "content": m.content} for m in last_messages], 10
+                )
+                throttle_groq_calls()
+                conversation.summary = summarize_conversation(conversation.summary, recent_for_summary)
+                db.commit()
+            except Exception as error:
+                db.rollback()
+                print(f"[Summary skipped] {type(error).__name__}: {error}")
 
     return {
-        "msg_id": assistant_msg.msg_id,
-        "content": assistant_msg.content,
-        "sender": assistant_msg.sender,
+        "msg_id": assistant_msg.msg_id if assistant_msg else None,
+        "content": answer,
+        "sender": "assistant",
         "disclaimer": DISCLAIMER,
         "sources": sources,
     }
