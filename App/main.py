@@ -691,3 +691,27 @@ def send_message(
         "disclaimer": DISCLAIMER,
         "sources": sources,
     }
+    return {"msg_id": new_msg.msg_id, "content": new_msg.content, "sender": new_msg.sender}
+
+@app.get("/api/v1/chat/conversations/{user_id}")
+def list_conversations(user_id: str, db: Session = Depends(get_db)):
+    conversations = db.query(Conversation).filter(
+        Conversation.user_id == user_id
+    ).order_by(Conversation.created_at.desc()).all()
+
+    return [
+        {"conv_id": c.conv_id, "title": c.title, "created_at": c.created_at}
+        for c in conversations
+    ]
+
+
+@app.get("/api/v1/chat/conversations/{conv_id}/messages")
+def get_conversation_messages(conv_id: str, db: Session = Depends(get_db)):
+    messages = db.query(Message).filter(
+        Message.conv_id == conv_id
+    ).order_by(Message.timestamp.asc()).all()
+
+    return [
+        {"msg_id": m.msg_id, "content": m.content, "sender": m.sender, "timestamp": m.timestamp}
+        for m in messages
+    ]
