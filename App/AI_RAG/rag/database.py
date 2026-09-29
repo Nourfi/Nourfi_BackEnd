@@ -14,14 +14,14 @@ load_dotenv(BASE_DIR / ".env")
 
 
 # ============================================================
-# DATABASE URL
+# SUPABASE_DATABASE_URL
 # ============================================================
 
-DATABASE_URL = os.getenv("DATABASE_URL") or os.getenv("SUPABASE_DB_URL")
+SUPABASE_DATABASE_URL = os.getenv("DATABASE_URL") or os.getenv("SUPABASE_DB_URL")
 
-if not DATABASE_URL:
+if not SUPABASE_DATABASE_URL:
     raise RuntimeError(
-        "DATABASE_URL is missing from .env"
+        "SUPABASE_DATABASE_URL is missing from .env"
     )
 
 
@@ -32,5 +32,5 @@ if not DATABASE_URL:
 def get_connection():
 
     return psycopg.connect(
-        DATABASE_URL
+        SUPABASE_DATABASE_URL
     )

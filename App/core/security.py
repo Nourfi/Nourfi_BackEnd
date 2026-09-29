@@ -21,7 +21,7 @@ ALGORITHM = "HS256"
 
 def create_access_token(data: dict) -> str:
     to_encode = data.copy()
-    expire = datetime.utcnow() + timedelta(minutes=60)  # expiring time is 1 hour
+    expire = datetime.utcnow() + timedelta(minutes=60* 24)  # expiring time is 1 hour
     to_encode.update({"exp": expire})
     
     encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
@@ -30,7 +30,7 @@ def create_access_token(data: dict) -> str:
 
 def decode_access_token(token: str) -> dict | None:
     try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        payload = jwt.decode(token, os.getenv("JWT_SECRET_KEY"), algorithms=["HS256"])
         return payload
     except Exception:
         return None
