@@ -2,6 +2,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 import os
 import random
+import re
 import secrets
 import time
 import uuid
@@ -14,6 +15,7 @@ from fastapi import Depends, FastAPI, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer
 from jose import jwt, JWTError
+from jose.exceptions import ExpiredSignatureError
 from pydantic import BaseModel, EmailStr
 from sqlalchemy.orm import Session
 
@@ -37,6 +39,7 @@ from App.AI_RAG.rag.pipeline import (
     answer_question,
     summarize_conversation,
     redact_sensitive_data,
+    is_memory_question,
     DISCLAIMER,
 )
 
@@ -54,16 +57,17 @@ def resolve_rag_database_url():
 RAG_DATABASE_URL, RAG_DATABASE_URL_SOURCE = resolve_rag_database_url()
 
 # Mémoire DANS une conversation
-SUMMARY_FREQUENCY = 10                  # résumé mis à jour tous les N messages
-RECENT_MESSAGES_LIMIT = 4               # derniers messages bruts envoyés au LLM
+SUMMARY_FREQUENCY = 4                   # résumé mis à jour tous les 4 messages (= tous les 2 échanges)
+SUMMARY_WINDOW = 8                      # messages relus pour mettre à jour le résumé
+RECENT_MESSAGES_LIMIT = 6               # derniers messages bruts (le pipeline les raccourcit)
 MAX_MESSAGE_CHARS = 600                 # troncature par message dans l'historique
-MIN_SECONDS_BETWEEN_GROQ_CALLS = 2.0
+MIN_SECONDS_BETWEEN_GROQ_CALLS = 0.5    # le pipeline gère déjà la file d'attente TPM
 
 # Mémoire ENTRE conversations
 CROSS_CONV_MAX_CONVERSATIONS = 3        # nb de conversations passées utilisées
 CROSS_CONV_DIGEST_QUESTIONS = 3         # si pas de résumé : nb de questions gardées
 CROSS_CONV_QUESTION_CHARS = 160         # troncature de chaque question
-CROSS_CONV_MAX_CHARS = 1200             # plafond total du contexte injecté
+CROSS_CONV_MAX_CHARS = 800              # plafond total (le pipeline plafonne aussi à ~200 tokens)
 
 # ------------------------------------------------------------------------------
 # AUTH — get_current_user (Member 1)
@@ -82,6 +86,14 @@ def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(
         if user_id is None:
             print("[JWT Auth Error] Field 'sub' is missing from payload")
             raise credentials_exception
+    except ExpiredSignatureError:
+        # Code stable que le frontend reconnaît pour renvoyer l'utilisateur vers /login.
+        print("[JWT Auth Error] Session expired")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="session_expired",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
     except JWTError as e:
         print(f"[JWT Auth Error] Validation failed: {str(e)}")
         raise HTTPException(
@@ -487,6 +499,18 @@ def build_cross_conversation_context(db: Session, user_id: str, current_conv_id:
         return None
     return redact_sensitive_data("\n".join(blocks))[:CROSS_CONV_MAX_CHARS]
 
+_CROSS_REF_RE = re.compile(
+    r"\b(before|earlier|previous(?:ly)?|last time|again|remember|as i (?:said|told|mentioned)|my (?:situation|case|project|goal)"
+    r"|avant|précédent\w*|la dernière fois|comme je (?:l'ai )?dit|ma situation|mon projet|mon cas"
+    r"|rappelle)\b|قبل|سابق|كما قلت|وضعي|مشروعي",
+    re.IGNORECASE,
+)
+
+def wants_cross_context(content: str, prior_count: int) -> bool:
+    """Le contexte des anciennes conversations coûte ~200 tokens: on ne l'envoie que si la
+    conversation vient de commencer, ou si la question renvoie au passé / à la situation de l'utilisateur."""
+    return prior_count < 2 or bool(_CROSS_REF_RE.search(content)) or is_memory_question(content)
+
 def get_owned_conversation(db: Session, conv_id: str, current_user: User) -> Conversation:
     """Vérifie que la conversation existe ET appartient à l'utilisateur connecté."""
     conversation = db.query(Conversation).filter(Conversation.conv_id == conv_id).first()
@@ -591,33 +615,24 @@ def send_message(
         RECENT_MESSAGES_LIMIT,
     )
 
-    cross_conversation_context = build_cross_conversation_context(
-        db, current_user.user_id, conversation.conv_id
+    cross_conversation_context = (
+        build_cross_conversation_context(db, current_user.user_id, conversation.conv_id)
+        if wants_cross_context(content, len(prior_messages))
+        else None
     )
 
     # 4. Appel au Pipeline RAG
     failed = False
     throttle_groq_calls()
     try:
-        # Tente de passer le cross_conversation_context au pipeline
-        try:
-            answer, results = answer_question(
-                question=content,
-                database_url=RAG_DATABASE_URL,
-                persona_name=persona_key,
-                conversation_summary=conversation.summary,
-                recent_messages=recent,
-                cross_conversation_context=cross_conversation_context,
-            )
-        except TypeError:
-            # Fallback si answer_question dans pipeline.py n'accepte pas encore cross_conversation_context
-            answer, results = answer_question(
-                question=content,
-                database_url=RAG_DATABASE_URL,
-                persona_name=persona_key,
-                conversation_summary=conversation.summary,
-                recent_messages=recent,
-            )
+        answer, results = answer_question(
+            question=content,
+            database_url=RAG_DATABASE_URL,
+            persona_name=persona_key,
+            conversation_summary=conversation.summary,
+            recent_messages=recent,
+            cross_conversation_context=cross_conversation_context,
+        )
     except Exception as error:
         failed = True
         print(f"[RAG error] {type(error).__name__}: {error}")
@@ -670,12 +685,12 @@ def send_message(
                     db.query(Message)
                     .filter(Message.conv_id == conversation.conv_id)
                     .order_by(Message.timestamp.desc())
-                    .limit(10)
+                    .limit(SUMMARY_WINDOW)
                     .all()
                 )
                 last_messages.reverse()
                 recent_for_summary = get_recent_messages(
-                    [{"role": m.sender, "content": m.content} for m in last_messages], 10
+                    [{"role": m.sender, "content": m.content} for m in last_messages], SUMMARY_WINDOW
                 )
                 throttle_groq_calls()
                 conversation.summary = summarize_conversation(conversation.summary, recent_for_summary)
@@ -691,27 +706,3 @@ def send_message(
         "disclaimer": DISCLAIMER,
         "sources": sources,
     }
-    return {"msg_id": new_msg.msg_id, "content": new_msg.content, "sender": new_msg.sender}
-
-@app.get("/api/v1/chat/conversations/{user_id}")
-def list_conversations(user_id: str, db: Session = Depends(get_db)):
-    conversations = db.query(Conversation).filter(
-        Conversation.user_id == user_id
-    ).order_by(Conversation.created_at.desc()).all()
-
-    return [
-        {"conv_id": c.conv_id, "title": c.title, "created_at": c.created_at}
-        for c in conversations
-    ]
-
-
-@app.get("/api/v1/chat/conversations/{conv_id}/messages")
-def get_conversation_messages(conv_id: str, db: Session = Depends(get_db)):
-    messages = db.query(Message).filter(
-        Message.conv_id == conv_id
-    ).order_by(Message.timestamp.asc()).all()
-
-    return [
-        {"msg_id": m.msg_id, "content": m.content, "sender": m.sender, "timestamp": m.timestamp}
-        for m in messages
-    ]
