@@ -1,6 +1,5 @@
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
-import os
 import random
 import re
 import secrets
@@ -42,32 +41,28 @@ from App.AI_RAG.rag.pipeline import (
     is_memory_question,
     DISCLAIMER,
 )
+from App.AI_RAG.rag.config import (
+    CORS_ORIGINS,
+    CROSS_CONV_DIGEST_QUESTIONS,
+    CROSS_CONV_MAX_CHARS,
+    CROSS_CONV_MAX_CONVERSATIONS,
+    CROSS_CONV_MIN_PRIOR_MESSAGES,
+    CROSS_CONV_QUESTION_CHARS,
+    EMAIL_CODE_EXPIRE_MINUTES,
+    MAX_MESSAGE_CHARS,
+    MIN_SECONDS_BETWEEN_LLM_CALLS,
+    RECENT_MESSAGES_LIMIT,
+    RESET_TOKEN_EXPIRE_MINUTES,
+    SESSION_EXPIRED_DETAIL,
+    SUMMARY_FREQUENCY,
+    SUMMARY_WINDOW,
+    resolve_database_url,
+)
 
 # ------------------------------------------------------------------------------
-# 0. CONFIG — base RAG + mémoire
+# 0. CONFIG - every tunable value lives in App/AI_RAG/rag/config.py
 # ------------------------------------------------------------------------------
-def resolve_rag_database_url():
-    """Base Supabase (table rag_chunks). Renvoie (url, nom_de_la_variable)."""
-    for name in ("SUPABASE_DATABASE_URL", "SUPABASE_DB_URL", "DATABASE_URL"):
-        value = os.getenv(name)
-        if value:
-            return value, name
-    return None, None
-
-RAG_DATABASE_URL, RAG_DATABASE_URL_SOURCE = resolve_rag_database_url()
-
-# Mémoire DANS une conversation
-SUMMARY_FREQUENCY = 4                   # résumé mis à jour tous les 4 messages (= tous les 2 échanges)
-SUMMARY_WINDOW = 8                      # messages relus pour mettre à jour le résumé
-RECENT_MESSAGES_LIMIT = 6               # derniers messages bruts (le pipeline les raccourcit)
-MAX_MESSAGE_CHARS = 600                 # troncature par message dans l'historique
-MIN_SECONDS_BETWEEN_GROQ_CALLS = 0.5    # le pipeline gère déjà la file d'attente TPM
-
-# Mémoire ENTRE conversations
-CROSS_CONV_MAX_CONVERSATIONS = 3        # nb de conversations passées utilisées
-CROSS_CONV_DIGEST_QUESTIONS = 3         # si pas de résumé : nb de questions gardées
-CROSS_CONV_QUESTION_CHARS = 160         # troncature de chaque question
-CROSS_CONV_MAX_CHARS = 800              # plafond total (le pipeline plafonne aussi à ~200 tokens)
+RAG_DATABASE_URL, RAG_DATABASE_URL_SOURCE = resolve_database_url()
 
 # ------------------------------------------------------------------------------
 # AUTH — get_current_user (Member 1)
@@ -91,7 +86,7 @@ def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(
         print("[JWT Auth Error] Session expired")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="session_expired",
+            detail=SESSION_EXPIRED_DETAIL,
             headers={"WWW-Authenticate": "Bearer"},
         )
     except JWTError as e:
@@ -135,7 +130,7 @@ app = FastAPI(lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_origins=list(CORS_ORIGINS),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -226,7 +221,7 @@ def generate_and_send_code(user, db):
         code_id=str(uuid.uuid4()),
         user_id=user.user_id,
         code=code,
-        expires_at=datetime.utcnow() + timedelta(minutes=15),
+        expires_at=datetime.utcnow() + timedelta(minutes=EMAIL_CODE_EXPIRE_MINUTES),
         used=False,
     )
     db.add(code_row)
@@ -301,7 +296,7 @@ def forgot_password(payload: ForgotPasswordRequest, db: Session = Depends(get_db
         token_id=str(uuid.uuid4()),
         user_id=user.user_id,
         token=reset_token,
-        expires_at=datetime.utcnow() + timedelta(minutes=30),
+        expires_at=datetime.utcnow() + timedelta(minutes=RESET_TOKEN_EXPIRE_MINUTES),
         used=False,
     )
     db.add(token_row)
@@ -436,11 +431,11 @@ def submit_onboarding(payload: OnboardingSubmitRequest, db: Session = Depends(ge
 _last_groq_call_time = 0.0
 
 def throttle_groq_calls():
-    """Espace les appels Groq d'au moins MIN_SECONDS_BETWEEN_GROQ_CALLS."""
+    """Espace les appels Groq d'au moins MIN_SECONDS_BETWEEN_LLM_CALLS."""
     global _last_groq_call_time
     elapsed = time.monotonic() - _last_groq_call_time
-    if elapsed < MIN_SECONDS_BETWEEN_GROQ_CALLS:
-        time.sleep(MIN_SECONDS_BETWEEN_GROQ_CALLS - elapsed)
+    if elapsed < MIN_SECONDS_BETWEEN_LLM_CALLS:
+        time.sleep(MIN_SECONDS_BETWEEN_LLM_CALLS - elapsed)
     _last_groq_call_time = time.monotonic()
 
 def detect_persona(financial_profile) -> str:
@@ -509,7 +504,7 @@ _CROSS_REF_RE = re.compile(
 def wants_cross_context(content: str, prior_count: int) -> bool:
     """Le contexte des anciennes conversations coûte ~200 tokens: on ne l'envoie que si la
     conversation vient de commencer, ou si la question renvoie au passé / à la situation de l'utilisateur."""
-    return prior_count < 2 or bool(_CROSS_REF_RE.search(content)) or is_memory_question(content)
+    return prior_count < CROSS_CONV_MIN_PRIOR_MESSAGES or bool(_CROSS_REF_RE.search(content)) or is_memory_question(content)
 
 def get_owned_conversation(db: Session, conv_id: str, current_user: User) -> Conversation:
     """Vérifie que la conversation existe ET appartient à l'utilisateur connecté."""
